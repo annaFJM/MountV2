@@ -1,0 +1,53 @@
+[
+    {
+        "type": "function",
+        "function": {
+            "name": "get_include_outbound",
+            "description": "获取给定名称节点的include关系出边指向的节点名称，适用于寻找给定材料数据的具体细分材料类别",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "id": {
+                        "description": "当前节点的id",
+                        "type": "string"
+                    }
+                },
+                "required": ["id"]
+            }
+        }
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "get_isbelongto_inbound",
+            "description": "获取给定名称节点的isbelongto关系入边来自哪些名称的节点，适用于已经确认材料数据的具体类别后，寻找具体的挂载节点",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "id": {
+                        "description": "当前节点的id称",
+                        "type": "string"
+                    }
+                },
+                "required": ["id"]
+            }
+        }
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "mount_data",
+            "description": "将材料数据挂载到指定的节点上，形成[data]-[isBelongTo]->[node]",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "id": {
+                        "description": "挂载的节点id",
+                        "type": "string"
+                    }
+                },
+                "required": ["id"]
+            }
+        }
+    }
+]
