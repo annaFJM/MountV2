@@ -8,8 +8,8 @@ from openai import OpenAI
 from datetime import datetime
 import numpy as np 
 from numpy.linalg import norm 
-# import torch 
-# from transformers import AutoTokenizer, AutoModel
+import torch 
+from transformers import AutoTokenizer, AutoModel
 sys.path.append(os.getcwd())
 from config import (
     NEO4J_URI, NEO4J_USER, NEO4J_PASSWORD,
@@ -36,12 +36,6 @@ logging.basicConfig(
 # 数据库接口初始化
 neo4j = Neo4jConnector(NEO4J_URI, NEO4J_USER, NEO4J_PASSWORD)
 
-client = OpenAI(
-    api_key=os.getenv("DASHSCOPE_API_KEY"),
-    base_url="https://dashscope.aliyuncs.com/compatible-mode/v1",
-)
-
-'''
 # --- 1. 加载运行时Embedding模型 --- # 
 RUNTIME_EMBED_MODEL_PATH = "/home/thl/models/Qwen3-4B-clustering_1078/checkpoint-936" 
 RUNTIME_EMBED_DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
@@ -59,17 +53,15 @@ try:
 except Exception as e:
     logging.info(f"⚠️ 警告：未能加载运行时Embedding模型: {e}")
     logging.info("     recall_top5_materials 功能将不可用。")
-'''
+
 # --- 2. 加载预计算的向量库 --- # 
 # EMBEDDINGS_DB_PATH = "/home/thl/2025Fall/LLM_Mount_KG/embedding/data/material_embeddings.npy"
 # EMBEDDINGS_METADATA_PATH = "/home/thl/2025Fall/LLM_Mount_KG/embedding/data/material_metadata.json"
 
 # 测试用
-# EMBEDDINGS_DB_PATH = "/home/thl/2025Fall/LLM_Mount_KG/test/data/material_embeddings.npy"
-# EMBEDDINGS_METADATA_PATH = "/home/thl/2025Fall/LLM_Mount_KG/test/data/material_metadata.json"
-# 加载 API 生成的向量库
-EMBEDDINGS_DB_PATH = "/home/thl/2025Fall/LLM_Mount_KG/test/data/material_embeddings_qwenAPI.npy"
-EMBEDDINGS_METADATA_PATH = "/home/thl/2025Fall/LLM_Mount_KG/test/data/material_metadata_qwenAPI.json"
+EMBEDDINGS_DB_PATH = "/home/thl/2025Fall/LLM_Mount_KG/test/data/material_embeddings.npy"
+EMBEDDINGS_METADATA_PATH = "/home/thl/2025Fall/LLM_Mount_KG/test/data/material_metadata.json"
+
 MATERIAL_EMBEDDINGS = None
 MATERIAL_METADATA = []
 MATERIAL_ID_TO_METADATA = {} # 用于快速查找
@@ -207,10 +199,9 @@ def get_embedding_for_data(data_item):
     
     return embedding.cpu().numpy()
 '''
-'''
 # 测试用
 
-def get_embedding_for_data(data_item):
+def get_embedding_for_data(data_item, supplementary_info=""): # <-- MODIFIED
     """
     (辅助函数)
     为传入的单个材料数据（新数据）生成embedding。
@@ -226,7 +217,15 @@ def get_embedding_for_data(data_item):
     props_copy.pop("data", None)   
     props_str = ", ".join([f"{k}: {v}" for k, v in props_copy.items() if v is not None])
 
-    text = f"{material_name}, 材料属性: {props_str}"
+    # --- MODIFIED ---
+    text_parts = [f"{material_name}, 材料属性: {props_str}"]
+    # 仅当补充信息有效时才添加
+    if supplementary_info and supplementary_info != "N/A" and "失败" not in supplementary_info:
+        text_parts.append(f"补充信息: {supplementary_info}")
+    
+    text = ", ".join(text_parts)
+    logging.info(f"--- 用于Embedding的文本: {text[:200]}... ---") # 增加日志
+    # --- 修改结束 ---
     
     # 生成 Embedding
     with torch.no_grad():
@@ -236,68 +235,21 @@ def get_embedding_for_data(data_item):
         embedding = last_hidden_state.mean(dim=1).squeeze()
     
     return embedding.cpu().numpy()
-'''
-# 调用qwen的embedding
-def get_embedding_for_data(data_item):
-    """
-    (辅助函数)
-    为传入的单个材料数据（新数据）生成embedding。
-    *** 已更新为使用 DashScope API ***
-    """
-    
-    # 检查全局 client 是否已初始化
-    if client is None:
-        logging.error("❌ 运行时 Embedding 失败：API 客户端未初始化。")
-        return None
 
-    # --- 格式化文本 (逻辑与你之前一致) ---
-    props_copy = data_item.copy()
-    material_name = props_copy.pop("name", "未知牌号") 
-    props_copy.pop("id", None)      
-    props_copy.pop("来源", None)  
-    props_copy.pop("data", None)    
-    
-    # 注意：这里我们保留 identity，因为它可能是用于 embedding 的有效属性
-    # 如果你不想让 identity 参与 embedding，在这里也 pop 掉它：
-    props_copy.pop("identity", None) 
-    
-    props_str = ", ".join([f"{k}: {v}" for k, v in props_copy.items() if v is not None])
-    
-    # 确保这个格式与你的离线 API 脚本 (generate_embeddings_from_api.py) 完全一致
-    text = f"{material_name}, 材料属性: {props_str}"
-    
-    # --- 调用 API 生成 Embedding ---
-    try:
-        completion = client.embeddings.create(
-            model="text-embedding-v4", # 使用与离线脚本相同的 embedding 模型
-            input=text
-        )
-        
-        # 提取 embedding (API返回的是 list)
-        embedding_list = completion.data[0].embedding
-        
-        # 转换为 numpy 数组，供 recall_top5_materials 使用
-        return np.array(embedding_list)
-        
-    except Exception as e:
-        logging.error(f"❌ 运行时 Embedding API 调用失败: {e}")
-        logging.error(f"   失败的文本: {text}")
-        return None
 
-def recall_top5_materials(current_node_id, data_item):
+def recall_top5_materials(current_node_id, data_item, supplementary_info=""): # <-- MODIFIED
     """
     (工具函数实现)
     在当前节点下，根据材料数据，通过向量召回Top-5最相似的Material节点。
     current_node_id: 当前节点ID
     data_item: 完整的材料数据 (用于生成embedding)
     """
-    # if MATERIAL_EMBEDDINGS is None or not MATERIAL_METADATA or RUNTIME_EMBED_MODEL is None:
-    #    return "向量召回功能不可用（模型或向量库未加载）。请使用 get_include_outbound 或 get_isbelongto_inbound。"
-    if MATERIAL_EMBEDDINGS is None or not MATERIAL_METADATA:
-        return "向量召回功能不可用（预计算的向量库未加载）。请使用 get_include_outbound 或 get_isbelongto_inbound。"
+    if MATERIAL_EMBEDDINGS is None or not MATERIAL_METADATA or RUNTIME_EMBED_MODEL is None:
+        return "向量召回功能不可用（模型或向量库未加载）。请使用 get_include_outbound 或 get_isbelongto_inbound。"
+
     # 1. 为新数据生成向量
     try:
-        query_embedding = get_embedding_for_data(data_item)
+        query_embedding = get_embedding_for_data(data_item, supplementary_info) # <-- MODIFIED
         if query_embedding is None:
             return "为新数据生成向量失败。请使用其他工具。"
     except Exception as e:
@@ -391,6 +343,12 @@ client = Ark(
 )
 '''
 
+client = OpenAI(
+    api_key=os.getenv("DASHSCOPE_API_KEY"),
+    base_url="https://dashscope.aliyuncs.com/compatible-mode/v1",
+)
+
+# --- NEW FUNCTION ADDED ---
 def get_supplementary_info_from_llm(client, data_item):
     """
     (新增函数)
@@ -437,7 +395,9 @@ name: '{material_name}'
     except Exception as e:
         logging.warning(f"⚠️ 调用LLM获取补充信息失败: {e}")
         return "获取补充信息失败"
-    
+# --- END OF NEW FUNCTION ---
+
+
 with open(result_filepath, 'w', encoding='utf-8') as f_out:
     # with open(DATA_FILE_PATH, "r") as f:  # 原代码
     with open("/home/thl/2025Fall/LLM_Mount_KG/test/data/test.json", "r") as f: # 测试用
@@ -445,7 +405,10 @@ with open(result_filepath, 'w', encoding='utf-8') as f_out:
         test_data_list = data_list[:20]
         logging.info(f"--- 成功加载数据，将仅测试前 {len(test_data_list)} 条数据 ---")
         for data in test_data_list:
+            # --- NEW: Get supplementary info ---
             supplementary_info = get_supplementary_info_from_llm(client, data)
+            # --- -------------------------- ---
+
             #初始节点
             curr_node = "材料"
             curr_id = 0
@@ -463,7 +426,7 @@ with open(result_filepath, 'w', encoding='utf-8') as f_out:
 # 当前状态
 - 当前节点ID: {curr_id}，名称：{curr_node}，标签：{curr_label}
 - 材料数据：{str(data)}
-- **补充信息**: {supplementary_info}
+- **补充信息**: {supplementary_info} # <-- MODIFIED
 
 # 可用工具
 1. get_include_outbound - 查看当前节点的下级分类
@@ -525,7 +488,7 @@ with open(result_filepath, 'w', encoding='utf-8') as f_out:
                         if total_count > 5:
                             # 2. 数量过多，自动触发向量召回
                             logging.info(f"--- 节点 {curr_id} 实例过多 ({total_count}个)，自动触发向量召回 ---")
-                            tool_result = recall_top5_materials(func_args["id"], data)
+                            tool_result = recall_top5_materials(func_args["id"], data, supplementary_info) # <-- MODIFIED
                             if not tool_result or "不可用" in tool_result or "未找到" in tool_result or "失败" in tool_result:
                                 logging.info(f"❌ 向量召回失败: {tool_result}")
                                 extra_info = "向量召回失败，终止当前数据。"
@@ -550,7 +513,7 @@ with open(result_filepath, 'w', encoding='utf-8') as f_out:
                     elif func_name == "recall_top5_materials":
                         # LLM 仍然可能直接调用它 (例如在promptTuning失败时)，我们保留这个路径
                         logging.info("--- LLM 主动调用 recall_top5_materials ---")
-                        tool_result = recall_top5_materials(func_args["id"], data)
+                        tool_result = recall_top5_materials(func_args["id"], data, supplementary_info) # <-- MODIFIED
                         if not tool_result or "不可用" in tool_result or "未找到" in tool_result or "失败" in tool_result:
                             logging.info(f"❌ 向量召回失败: {tool_result}")
                             extra_info = "向量召回失败，终止当前数据。"

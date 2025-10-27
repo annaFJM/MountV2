@@ -5,3 +5,4 @@ results/
 embedding/
 config.py
 test/
+test_model/
