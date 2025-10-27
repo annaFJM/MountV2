@@ -2,22 +2,72 @@ import requests
 import json
 import os
 import sys
-from openai import OpenAI
+from volcenginesdkarkruntime import Ark
 from datetime import datetime
 import numpy as np 
 from numpy.linalg import norm 
 import torch 
 from transformers import AutoTokenizer, AutoModel
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from threading import Lock
+import time
+from tqdm import tqdm
 sys.path.append(os.getcwd())
 from config import (
     NEO4J_URI, NEO4J_USER, NEO4J_PASSWORD,
-    DATA_FILE_PATH, DEEPSEEK_API_KEY , DEEPSEEK_BASE_URL,
+    DATA_FILE_PATH, 
+    # DEEPSEEK_API_KEY , DEEPSEEK_BASE_URL,
+    # VOLCANO_API_KEY, VOLCANO_REGION,
     RESULT_DIR, RESULT_FILE_PREFIX
 )
 from neo4j_connector import Neo4jConnector
 
+# --- MODIFICATION: Configuration for Multithreading ---
+MAX_WORKERS = 5  # Concurrent threads, adjust based on your API limits (5-10 is a good start)
+
+# --- MODIFICATION: API Key Management ---
+# Load API keys from environment variables or a list
+API_KEYS = [
+    os.environ.get("ARK_API_KEY"),
+    # "your_second_api_key",  # If you have a second key, uncomment
+    # "your_third_api_key",   # A third one
+]
+API_KEYS = [key for key in API_KEYS if key]  # Filter out any None values
+
+if not API_KEYS:
+    print("❌ Error: No API keys found. Please set the ARK_API_KEY environment variable.")
+    sys.exit(1)
+
+# Create a list of API clients
+clients = [
+    Ark(base_url="https://ark.cn-beijing.volces.com/api/v3", api_key=key)
+    for key in API_KEYS
+]
+
+# Thread-safe counters for rotating API keys
+api_client_counter = 0
+api_client_lock = Lock()
+
+def get_next_api_client():
+    """
+    Rotates through the available API clients in a thread-safe manner.
+    """
+    global api_client_counter
+    with api_client_lock:
+        client = clients[api_client_counter]
+        api_client_counter = (api_client_counter + 1) % len(clients)
+        return client
+# --- End of MODIFICATION ---
+
 # 数据库接口初始化
 neo4j = Neo4jConnector(NEO4J_URI, NEO4J_USER, NEO4J_PASSWORD)
+
+# 文件写入锁
+file_lock = Lock()
+
+# API轮询计数器和锁
+api_counter = 0
+api_lock = Lock()
 
 # --- 1. 加载运行时Embedding模型 --- # 
 RUNTIME_EMBED_MODEL_PATH = "/home/thl/models/Qwen3-4B-clustering_1078/checkpoint-936" 
@@ -40,6 +90,10 @@ except Exception as e:
 # --- 2. 加载预计算的向量库 --- # 
 EMBEDDINGS_DB_PATH = "/home/thl/2025Fall/LLM_Mount_KG/embedding/data/material_embeddings.npy"
 EMBEDDINGS_METADATA_PATH = "/home/thl/2025Fall/LLM_Mount_KG/embedding/data/material_metadata.json"
+
+# 测试用
+# EMBEDDINGS_DB_PATH = "/home/thl/2025Fall/LLM_Mount_KG/test/data/material_embeddings.npy"
+# EMBEDDINGS_METADATA_PATH = "/home/thl/2025Fall/LLM_Mount_KG/test/data/material_metadata.json"
 
 MATERIAL_EMBEDDINGS = None
 MATERIAL_METADATA = []
@@ -127,6 +181,8 @@ def get_isbelongto_inbound(inbound_ids, inbound_names, inbound_labels):
     
     return "\n".join(result_list)
 
+# 原函数
+
 def get_embedding_for_data(data_item):
     """
     (辅助函数)
@@ -174,6 +230,36 @@ def get_embedding_for_data(data_item):
         embedding = last_hidden_state.mean(dim=1).squeeze()
     
     return embedding.cpu().numpy()
+
+# 测试用
+'''
+def get_embedding_for_data(data_item):
+    """
+    (辅助函数)
+    为传入的单个材料数据（新数据）生成embedding。
+    *** 已更新，以匹配 v3 离线脚本的逻辑 ***
+    """
+    if not RUNTIME_EMBED_MODEL or not RUNTIME_EMBED_TOKENIZER:
+        print("❌ 运行时Embedding模型未加载。")
+        return None
+    props_copy = data_item.copy()
+    material_name = props_copy.pop("name", "未知牌号") 
+    props_copy.pop("id", None)     
+    props_copy.pop("来源", None)   
+    props_copy.pop("data", None)   
+    props_str = ", ".join([f"{k}: {v}" for k, v in props_copy.items() if v is not None])
+
+    text = f"材料名称: {material_name}, 材料属性: {props_str}"
+    
+    # 生成 Embedding
+    with torch.no_grad():
+        inputs = RUNTIME_EMBED_TOKENIZER(text, return_tensors="pt", padding=True, truncation=True, max_length=512).to(RUNTIME_EMBED_DEVICE)
+        outputs = RUNTIME_EMBED_MODEL(**inputs)
+        last_hidden_state = outputs.last_hidden_state
+        embedding = last_hidden_state.mean(dim=1).squeeze()
+    
+    return embedding.cpu().numpy()
+'''
 
 def recall_top5_materials(current_node_id, data_item):
     """
@@ -238,7 +324,8 @@ def mount_data(id, data, f_out):
     f_out: 打开的文件句柄
     """
     try:
-        data_id = data.get('_id', 'UNKNOWN_ID') 
+        data_id = data.get('_id', 'UNKNOWN_ID') # 原代码
+        # data_id = data.get('id', 'UNKNOWN_ID')  # 测试用
         target_node_id = str(id)
         relation_name = "isBelongTo"
 
@@ -267,13 +354,14 @@ tools = []
 with open('/home/thl/2025Fall/LLM_Mount_KG/tools.json', 'r', encoding='utf-8') as f:
     tools = json.load(f)
 
-# LLM调用接口
-client = OpenAI(
-    api_key=DEEPSEEK_API_KEY, #已脱敏
-    base_url=DEEPSEEK_BASE_URL,
+client = Ark(
+    base_url="https://ark.cn-beijing.volces.com/api/v3",
+    api_key=os.environ.get("ARK_API_KEY"),
 )
+
 with open(result_filepath, 'w', encoding='utf-8') as f_out:
-    with open(DATA_FILE_PATH, "r") as f:
+    with open(DATA_FILE_PATH, "r") as f:  # 原代码
+    # with open("/home/thl/2025Fall/LLM_Mount_KG/test/data/test.json", "r") as f: # 测试用
         data_list = json.load(f)
         for data in data_list:
             #初始节点
@@ -314,15 +402,11 @@ with open(result_filepath, 'w', encoding='utf-8') as f_out:
 
                 # 第一次调用：模型决定是否调用函数
                 response = client.chat.completions.create(
-                    model="deepseek-chat",
+                    # model="deepseek-chat",
+                    model="ep-20251027162913-hvhdm",
                     messages=messages,
                     tools=tools,
-                    tool_choice="auto",
-                    extra_body={
-                        "thinking": {
-                            "type": "disabled"
-                        }
-                    }
+                    tool_choice="auto"
                 )
 
                 response_message = response.choices[0].message
@@ -416,13 +500,9 @@ with open(result_filepath, 'w', encoding='utf-8') as f_out:
                     
                     # 第二次调用：模型基于函数结果决定去向
                     second_response = client.chat.completions.create(
-                        model="deepseek-chat",
-                        messages=messages,
-                        extra_body={
-                            "thinking": {
-                                "type": "disabled"
-                            }
-                        }
+                        # model="deepseek-chat",
+                        model="ep-20251027162913-hvhdm",
+                        messages=messages
                     )
                     final_answer = second_response.choices[0].message.content
                     print("-"*30)
