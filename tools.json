@@ -34,6 +34,23 @@
         }
     },
     {
+      "type": "function",
+      "function": {
+        "name": "recall_top5_materials",
+        "description": "当get_isbelongto_inbound返回的选项过多或不相关时，使用此工具。它会根据材料数据，通过向量相似度召回最相关的Top-5个Material节点。",
+        "parameters": {
+          "type": "object",
+          "properties": {
+            "id": {
+              "description": "当前节点的id（通常是Class节点，如'高熵合金'）",
+              "type": "string"
+            }
+          },
+          "required": ["id"]
+        }
+      }
+    },
+    {
         "type": "function",
         "function": {
             "name": "mount_data",

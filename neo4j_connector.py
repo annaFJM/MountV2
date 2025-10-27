@@ -90,8 +90,9 @@ class Neo4jConnector:
                     target_name.append(record["name"])
                     target_label.append(record["label"][0])
 
-                return target_ids[:5], target_name[:5], target_label[:5]
+                # return target_ids[:5], target_name[:5], target_label[:5]
                 # todo: 这里默认返回前5个，实际需要返回最接近的5个
+                return target_ids, target_name, target_label
             
             except Exception as e:
                 print(f"❌ 获取节点labels时出错: {e}")
