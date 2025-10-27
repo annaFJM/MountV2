@@ -2,16 +2,13 @@ import requests
 import json
 import os
 import sys
+import logging
 from volcenginesdkarkruntime import Ark
 from datetime import datetime
 import numpy as np 
 from numpy.linalg import norm 
 import torch 
 from transformers import AutoTokenizer, AutoModel
-from concurrent.futures import ThreadPoolExecutor, as_completed
-from threading import Lock
-import time
-from tqdm import tqdm
 sys.path.append(os.getcwd())
 from config import (
     NEO4J_URI, NEO4J_USER, NEO4J_PASSWORD,
@@ -22,52 +19,21 @@ from config import (
 )
 from neo4j_connector import Neo4jConnector
 
-# --- MODIFICATION: Configuration for Multithreading ---
-MAX_WORKERS = 5  # Concurrent threads, adjust based on your API limits (5-10 is a good start)
-
-# --- MODIFICATION: API Key Management ---
-# Load API keys from environment variables or a list
-API_KEYS = [
-    os.environ.get("ARK_API_KEY"),
-    # "your_second_api_key",  # If you have a second key, uncomment
-    # "your_third_api_key",   # A third one
-]
-API_KEYS = [key for key in API_KEYS if key]  # Filter out any None values
-
-if not API_KEYS:
-    print("❌ Error: No API keys found. Please set the ARK_API_KEY environment variable.")
-    sys.exit(1)
-
-# Create a list of API clients
-clients = [
-    Ark(base_url="https://ark.cn-beijing.volces.com/api/v3", api_key=key)
-    for key in API_KEYS
-]
-
-# Thread-safe counters for rotating API keys
-api_client_counter = 0
-api_client_lock = Lock()
-
-def get_next_api_client():
-    """
-    Rotates through the available API clients in a thread-safe manner.
-    """
-    global api_client_counter
-    with api_client_lock:
-        client = clients[api_client_counter]
-        api_client_counter = (api_client_counter + 1) % len(clients)
-        return client
-# --- End of MODIFICATION ---
+log_dir = "/home/thl/2025Fall/LLM_Mount_KG/log"
+os.makedirs(log_dir, exist_ok=True)
+log_timestamp = datetime.now().strftime("%Y%m%d-%H%M%S")
+log_filepath = os.path.join(log_dir, f"{log_timestamp}.log")
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(levelname)s - %(message)s',
+    handlers=[
+        logging.FileHandler(log_filepath, encoding='utf-8'),
+        logging.StreamHandler()  # 同时输出到控制台
+    ]
+)
 
 # 数据库接口初始化
 neo4j = Neo4jConnector(NEO4J_URI, NEO4J_USER, NEO4J_PASSWORD)
-
-# 文件写入锁
-file_lock = Lock()
-
-# API轮询计数器和锁
-api_counter = 0
-api_lock = Lock()
 
 # --- 1. 加载运行时Embedding模型 --- # 
 RUNTIME_EMBED_MODEL_PATH = "/home/thl/models/Qwen3-4B-clustering_1078/checkpoint-936" 
@@ -76,24 +42,24 @@ RUNTIME_EMBED_TOKENIZER = None
 RUNTIME_EMBED_MODEL = None
 
 try:
-    print(f"--- 正在加载运行时Embedding模型到 {RUNTIME_EMBED_DEVICE} ---")
+    logging.info(f"--- 正在加载运行时Embedding模型到 {RUNTIME_EMBED_DEVICE} ---")
     RUNTIME_EMBED_TOKENIZER = AutoTokenizer.from_pretrained(RUNTIME_EMBED_MODEL_PATH)
     RUNTIME_EMBED_MODEL = AutoModel.from_pretrained(
         RUNTIME_EMBED_MODEL_PATH, 
         torch_dtype="auto"
     ).to(RUNTIME_EMBED_DEVICE).eval()
-    print(f"✅ 成功加载用于运行时推理的Embedding模型。")
+    logging.info(f"✅ 成功加载用于运行时推理的Embedding模型。")
 except Exception as e:
-    print(f"⚠️ 警告：未能加载运行时Embedding模型: {e}")
-    print("     recall_top5_materials 功能将不可用。")
+    logging.info(f"⚠️ 警告：未能加载运行时Embedding模型: {e}")
+    logging.info("     recall_top5_materials 功能将不可用。")
 
 # --- 2. 加载预计算的向量库 --- # 
-EMBEDDINGS_DB_PATH = "/home/thl/2025Fall/LLM_Mount_KG/embedding/data/material_embeddings.npy"
-EMBEDDINGS_METADATA_PATH = "/home/thl/2025Fall/LLM_Mount_KG/embedding/data/material_metadata.json"
+# EMBEDDINGS_DB_PATH = "/home/thl/2025Fall/LLM_Mount_KG/embedding/data/material_embeddings.npy"
+# EMBEDDINGS_METADATA_PATH = "/home/thl/2025Fall/LLM_Mount_KG/embedding/data/material_metadata.json"
 
 # 测试用
-# EMBEDDINGS_DB_PATH = "/home/thl/2025Fall/LLM_Mount_KG/test/data/material_embeddings.npy"
-# EMBEDDINGS_METADATA_PATH = "/home/thl/2025Fall/LLM_Mount_KG/test/data/material_metadata.json"
+EMBEDDINGS_DB_PATH = "/home/thl/2025Fall/LLM_Mount_KG/test/data/material_embeddings.npy"
+EMBEDDINGS_METADATA_PATH = "/home/thl/2025Fall/LLM_Mount_KG/test/data/material_metadata.json"
 
 MATERIAL_EMBEDDINGS = None
 MATERIAL_METADATA = []
@@ -104,13 +70,14 @@ try:
     with open(EMBEDDINGS_METADATA_PATH, 'r', encoding='utf-8') as f:
         MATERIAL_METADATA = json.load(f)
         # 创建一个 ID -> 元数据 的映射，方便使用
-        MATERIAL_ID_TO_METADATA = {item['id']: item for item in MATERIAL_METADATA}
+        MATERIAL_ID_TO_METADATA = {item['identity']: item for item in MATERIAL_METADATA}
         
-    print(f"✅ 成功加载 {len(MATERIAL_METADATA)} 条预计算的Material向量。")
+    logging.info(f"✅ 成功加载 {len(MATERIAL_METADATA)} 条预计算的Material向量。")
+    print(f"🔍 示例key: {list(MATERIAL_ID_TO_METADATA.keys())[:3]}")  # 看看key是什么格式
 except Exception as e:
-    print(f"⚠️ 警告：未能加载预计算的Material向量: {e}")
-    print(f"     路径: {EMBEDDINGS_DB_PATH}, {EMBEDDINGS_METADATA_PATH}")
-    print("     recall_top5_materials 功能将不可用。")
+    logging.info(f"⚠️ 警告：未能加载预计算的Material向量: {e}")
+    logging.info(f"     路径: {EMBEDDINGS_DB_PATH}, {EMBEDDINGS_METADATA_PATH}")
+    logging.info("     recall_top5_materials 功能将不可用。")
 
 def get_include_outbound(id):
     # 获取所有include出边
@@ -142,7 +109,7 @@ def get_include_outbound(id):
         else:
             info += "该下游节点没有isBelongTo入边。"
         result_list.append(info)
-        # print(info)
+        # logging.info(info)
 
     return "\n".join(result_list)
 
@@ -182,14 +149,14 @@ def get_isbelongto_inbound(inbound_ids, inbound_names, inbound_labels):
     return "\n".join(result_list)
 
 # 原函数
-
+'''
 def get_embedding_for_data(data_item):
     """
     (辅助函数)
     为传入的单个材料数据（新数据）生成embedding。
     """
     if not RUNTIME_EMBED_MODEL or not RUNTIME_EMBED_TOKENIZER:
-        print("❌ 运行时Embedding模型未加载。")
+        logging.info("❌ 运行时Embedding模型未加载。")
         return None
     
     # 扁平化 (来自 neo4j_connector.py)
@@ -230,9 +197,9 @@ def get_embedding_for_data(data_item):
         embedding = last_hidden_state.mean(dim=1).squeeze()
     
     return embedding.cpu().numpy()
-
-# 测试用
 '''
+# 测试用
+
 def get_embedding_for_data(data_item):
     """
     (辅助函数)
@@ -240,7 +207,7 @@ def get_embedding_for_data(data_item):
     *** 已更新，以匹配 v3 离线脚本的逻辑 ***
     """
     if not RUNTIME_EMBED_MODEL or not RUNTIME_EMBED_TOKENIZER:
-        print("❌ 运行时Embedding模型未加载。")
+        logging.info("❌ 运行时Embedding模型未加载。")
         return None
     props_copy = data_item.copy()
     material_name = props_copy.pop("name", "未知牌号") 
@@ -249,7 +216,7 @@ def get_embedding_for_data(data_item):
     props_copy.pop("data", None)   
     props_str = ", ".join([f"{k}: {v}" for k, v in props_copy.items() if v is not None])
 
-    text = f"材料名称: {material_name}, 材料属性: {props_str}"
+    text = f"{material_name}, 材料属性: {props_str}"
     
     # 生成 Embedding
     with torch.no_grad():
@@ -259,7 +226,7 @@ def get_embedding_for_data(data_item):
         embedding = last_hidden_state.mean(dim=1).squeeze()
     
     return embedding.cpu().numpy()
-'''
+
 
 def recall_top5_materials(current_node_id, data_item):
     """
@@ -277,14 +244,14 @@ def recall_top5_materials(current_node_id, data_item):
         if query_embedding is None:
             return "为新数据生成向量失败。请使用其他工具。"
     except Exception as e:
-        print(f"❌ 为新数据生成向量时出错: {e}")
+        logging.info(f"❌ 为新数据生成向量时出错: {e}")
         return f"为新数据生成向量时出错: {e}。请使用其他工具。"
 
     # 2. 计算余弦相似度
     query_embedding = query_embedding.flatten()
     query_norm = norm(query_embedding)
     if query_norm == 0:
-        print("⚠️ 警告: 查询向量的范数为0。")
+        logging.info("⚠️ 警告: 查询向量的范数为0。")
         return "查询向量生成失败（范数为0）。请使用其他工具。"
         
     db_norms = norm(MATERIAL_EMBEDDINGS, axis=1)
@@ -302,7 +269,7 @@ def recall_top5_materials(current_node_id, data_item):
             meta_item = MATERIAL_METADATA[idx] 
             sim_score = similarities[idx]
             
-            node_id = meta_item.get("id")
+            node_id = meta_item.get("identity")
             node_name = meta_item.get("name")
             node_label = meta_item.get("label")
             
@@ -324,9 +291,9 @@ def mount_data(id, data, f_out):
     f_out: 打开的文件句柄
     """
     try:
-        data_id = data.get('_id', 'UNKNOWN_ID') # 原代码
-        # data_id = data.get('id', 'UNKNOWN_ID')  # 测试用
-        target_node_id = str(id)
+        # data_id = data.get('_id', 'UNKNOWN_ID') # 原代码
+        data_id = data.get('identity', 'UNKNOWN_ID')  # 测试用
+        target_node_id = id
         relation_name = "isBelongTo"
 
         result_record = {
@@ -340,7 +307,7 @@ def mount_data(id, data, f_out):
         return f"成功记录到文件：data {data_id} -> [{relation_name}] -> node {target_node_id}"
 
     except Exception as e:
-        print(f"❌ 写入文件失败: {e}")
+        logging.info(f"❌ 写入文件失败: {e}")
         return f"写入文件失败：{e}"
 
 os.makedirs(RESULT_DIR, exist_ok=True)
@@ -348,31 +315,41 @@ timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
 result_filename = f"{RESULT_FILE_PREFIX}_{timestamp}.jsonl" 
 result_filepath = os.path.join(RESULT_DIR, result_filename)
 
-print(f"✅ 结果将保存到: {result_filepath}")
+logging.info(f"✅ 结果将保存到: {result_filepath}")
 # 获取所有function
 tools = []
 with open('/home/thl/2025Fall/LLM_Mount_KG/tools.json', 'r', encoding='utf-8') as f:
     tools = json.load(f)
 
+# LLM调用接口
+'''
+client = OpenAI(
+    api_key=DEEPSEEK_API_KEY, #已脱敏
+    base_url=DEEPSEEK_BASE_URL,
+)
+'''
 client = Ark(
     base_url="https://ark.cn-beijing.volces.com/api/v3",
     api_key=os.environ.get("ARK_API_KEY"),
 )
 
 with open(result_filepath, 'w', encoding='utf-8') as f_out:
-    with open(DATA_FILE_PATH, "r") as f:  # 原代码
-    # with open("/home/thl/2025Fall/LLM_Mount_KG/test/data/test.json", "r") as f: # 测试用
+    # with open(DATA_FILE_PATH, "r") as f:  # 原代码
+    with open("/home/thl/2025Fall/LLM_Mount_KG/test/data/test.json", "r") as f: # 测试用
         data_list = json.load(f)
-        for data in data_list:
+        test_data_list = data_list[:20]
+        logging.info(f"--- 成功加载数据，将仅测试前 {len(test_data_list)} 条数据 ---")
+        for data in test_data_list:
             #初始节点
             curr_node = "材料"
             curr_id = 0
             curr_label = "Class"
             extra_info = ""
+            mount_succeeded = False
 
             for i in range(7):
                 # 最多6轮
-                print("="*20 + f"第{str(i+1)}轮" + "="*20)
+                logging.info("="*20 + f"第{str(i+1)}轮" + "="*20)
                 prompt = f"""
 # 任务说明
 你正在材料知识图谱中导航，目标是将材料数据挂载到正确材料牌号下。
@@ -396,7 +373,7 @@ with open(result_filepath, 'w', encoding='utf-8') as f_out:
 {extra_info}
 """
     # todo prompt这里因为暂时向量召回未实现，要求其到Material节点强行执行挂载
-                print(prompt)
+                logging.info(prompt)
                 # 用户查询
                 messages = [{"role": "user", "content": prompt}]
 
@@ -413,16 +390,16 @@ with open(result_filepath, 'w', encoding='utf-8') as f_out:
 
                 # 检查模型是否要求调用函数
                 if response_message.tool_calls:
-                    print("-"*30)
-                    print("function call")
+                    logging.info("-"*30)
+                    logging.info("function call")
                     # 提取函数调用信息
                     tool_call = response_message.tool_calls[0]
                     func_name = tool_call.function.name
                     func_args = json.loads(tool_call.function.arguments)
 
-                    print(f"function name: {func_name}")
-                    print(f"function args: {func_args}")
-                    print("-"*30)
+                    logging.info(f"function name: {func_name}")
+                    logging.info(f"function args: {func_args}")
+                    logging.info("-"*30)
                     
                     # 执行对应的函数
                     if func_name == "get_include_outbound":
@@ -439,16 +416,16 @@ with open(result_filepath, 'w', encoding='utf-8') as f_out:
                         
                         if total_count > 5:
                             # 2. 数量过多，自动触发向量召回
-                            print(f"--- 节点 {curr_id} 实例过多 ({total_count}个)，自动触发向量召回 ---")
+                            logging.info(f"--- 节点 {curr_id} 实例过多 ({total_count}个)，自动触发向量召回 ---")
                             tool_result = recall_top5_materials(func_args["id"], data)
                             if not tool_result or "不可用" in tool_result or "未找到" in tool_result or "失败" in tool_result:
-                                print(f"❌ 向量召回失败: {tool_result}")
+                                logging.info(f"❌ 向量召回失败: {tool_result}")
                                 extra_info = "向量召回失败，终止当前数据。"
                                 break # 终止当前数据的处理
                         
                         elif 0 < total_count <= 5:
                             # 3. 数量可控 (<=5)，调用 *新* 的格式化函数
-                            print(f"--- 节点 {curr_id} 实例数量可控 ({total_count}个)，使用 get_isbelongto_inbound ---")
+                            logging.info(f"--- 节点 {curr_id} 实例数量可控 ({total_count}个)，使用 get_isbelongto_inbound ---")
                             # 我们重用已经获取的数据，而不是再次查询
                             tool_result = get_isbelongto_inbound(inbound_ids, inbound_names, inbound_labels)
                         
@@ -458,22 +435,23 @@ with open(result_filepath, 'w', encoding='utf-8') as f_out:
                         
                         if len(tool_result) == 0:
                             extra_info = "上一次调用get_isbelongto_inbound没有任何结果。这可能是一个空的叶子节点，无法挂载。"
-                            print(extra_info)
+                            logging.info(extra_info)
                             break # 终止当前数据的处理
                         # <--- 新逻辑结束 ---
 
                     elif func_name == "recall_top5_materials":
                         # LLM 仍然可能直接调用它 (例如在promptTuning失败时)，我们保留这个路径
-                        print("--- LLM 主动调用 recall_top5_materials ---")
+                        logging.info("--- LLM 主动调用 recall_top5_materials ---")
                         tool_result = recall_top5_materials(func_args["id"], data)
                         if not tool_result or "不可用" in tool_result or "未找到" in tool_result or "失败" in tool_result:
-                            print(f"❌ 向量召回失败: {tool_result}")
+                            logging.info(f"❌ 向量召回失败: {tool_result}")
                             extra_info = "向量召回失败，终止当前数据。"
                             break
                         
                     elif func_name == "mount_data":
                         tool_result = mount_data(func_args["id"], data, f_out)
-                        print(tool_result)
+                        logging.info(tool_result)
+                        mount_succeeded = True
                         break
 
                     extra_info = ""                     
@@ -495,7 +473,7 @@ with open(result_filepath, 'w', encoding='utf-8') as f_out:
 示例：
 0 材料 Class
 """
-                    print(prompt)
+                    logging.info(prompt)
                     messages = [{"role": "user", "content": prompt}]
                     
                     # 第二次调用：模型基于函数结果决定去向
@@ -505,9 +483,9 @@ with open(result_filepath, 'w', encoding='utf-8') as f_out:
                         messages=messages
                     )
                     final_answer = second_response.choices[0].message.content
-                    print("-"*30)
-                    print(final_answer)
-                    print("-"*30)
+                    logging.info("-"*30)
+                    logging.info(final_answer)
+                    logging.info("-"*30)
                     if final_answer == "完毕":
                         break
                     else:
@@ -524,15 +502,31 @@ with open(result_filepath, 'w', encoding='utf-8') as f_out:
                                 curr_node = " ".join(parts[1:-1])
                             else:
                                 # 至少需要 ID, Name, Label
-                                print(f"❌ AI返回格式错误 (部件太少): '{final_answer}'")
+                                logging.info(f"❌ AI返回格式错误 (部件太少): '{final_answer}'")
                                 raise IndexError
                             
                         except IndexError:
-                            print(f"❌ AI返回格式错误: '{final_answer}'， 终止当前数据处理。")
+                            logging.info(f"❌ AI返回格式错误: '{final_answer}'， 终止当前数据处理。")
                             break
                         
                 else:
                     # 模型未调用函数，直接返回回答
-                    print(response_message.content)
+                    logging.info(response_message.content)
 
-print(f"✅ 任务完成，所有数据已处理并保存到: {result_filepath}")
+            # 检查挂载是否成功，如果不成功，则写入失败记录
+            if not mount_succeeded:
+                try:
+                    # 从 data 对象获取 identity
+                    data_id = data.get('identity', 'UNKNOWN_ID') 
+                    logging.info(f"--- 数据 {data_id} 未能成功挂载，写入空值记录 ---")
+
+                    failure_record = {
+                        "data_id": data_id,
+                        "target_node_id": None,  # 按要求设为空值
+                        "relation_type": None    # 按要求设为空值
+                    }
+                    f_out.write(json.dumps(failure_record, ensure_ascii=False) + '\n')
+
+                except Exception as e:
+                    logging.info(f"❌ 写入失败记录 (data_id: {data_id}) 时发生错误: {e}")
+logging.info(f"✅ 任务完成，所有数据已处理并保存到: {result_filepath}")

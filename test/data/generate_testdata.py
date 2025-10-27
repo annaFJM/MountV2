@@ -1,3 +1,4 @@
+#!/usr/bin/env python
 # generate_test_data.py
 
 import os
@@ -25,6 +26,9 @@ def deflatten_dict(flat_dict):
     """
     将从Neo4j获取的扁平化属性字典 "反扁平化" 为嵌套的JSON结构。
     例如: 'data_成分比重_Mn' -> data: {'成分比重': {'Mn': ...}}
+    
+    *** 注意：对于没有 'data_' 前缀的键 (如 'name', '工艺'), 
+    *** 它们会保持在顶层，这符合您当前的需求。
     """
     nested_dict = {}
     data_sub_dict = {}
@@ -49,9 +53,11 @@ def deflatten_dict(flat_dict):
             # 设置最后一个部分的值
             current_level[parts[-1]] = value
         else:
-            # 3. 处理其他可能的根级别键 (尽管在您的示例中没有)
+            # 3. 处理其他可能的根级别键 (例如 'name', 'id', '工艺' 等)
             nested_dict[key] = value
 
+    # 即使没有 'data_' 键，也会添加一个空的 'data' 字典
+    # 下游脚本 (generate_embeddings) 会处理掉这个空字典
     nested_dict['data'] = data_sub_dict
     return nested_dict
 
@@ -63,7 +69,9 @@ def main():
     
     # 1. 定义查询
     # 这个查询找到所有连接到'高熵合金'且有>=2个Entity的Material
-    # 然后为每个Material返回两个不同的Entity的属性，以及Material的ID
+    # 然后为每个Material返回两个不同Entity的属性，以及Material的ID
+    
+    # (查询保持不变，继续使用 id() 来获取整数ID)
     cypher_query = """
     MATCH (c:Class {name: '高熵合金'})<-[:isBelongTo]-(m:Material)
     MATCH (e:Entity)-[:isBelongTo]->(m)
@@ -74,8 +82,10 @@ def main():
     WITH m, collect(e) AS entities
     RETURN 
         id(m) AS material_id,
-        properties(entities[0]) AS entity_for_test,
-        properties(entities[1]) AS entity_for_embedding
+        properties(entities[0]) AS entity_props_for_test,
+        id(entities[0]) AS entity_identity_for_test, 
+        properties(entities[1]) AS entity_props_for_embedding,
+        id(entities[1]) AS entity_identity_for_embedding
     """
 
     driver = None
@@ -99,22 +109,35 @@ def main():
 
             # 3. 处理数据
             for record in tqdm(records, desc="处理节点数据"):
-                flat_test_entity = record['entity_for_test']
-                flat_embedding_entity = record['entity_for_embedding']
-                material_id_str = str(record['material_id'])
+                
+                # 捕获所有需要的 ID
+                flat_test_props = record['entity_props_for_test']
+                test_identity = record['entity_identity_for_test'] # 整数 ID
+                
+                flat_embedding_props = record['entity_props_for_embedding']
+                embedding_identity = record['entity_identity_for_embedding'] # 整数 ID
+                
+                material_id_str = str(record['material_id']) # 整数 ID 转为字符串
 
-                # 反扁平化数据
-                nested_test_entity = deflatten_dict(flat_test_entity)
-                nested_embedding_entity = deflatten_dict(flat_embedding_entity)
+                # 反扁平化数据 (这会保留 'name', 'id' 等在顶层)
+                nested_test_entity = deflatten_dict(flat_test_props)
+                nested_embedding_entity = deflatten_dict(flat_embedding_props)
+
+                # 将整数 identity 添加到字典中
+                nested_test_entity['identity'] = test_identity
+                nested_embedding_entity['identity'] = record['material_id']
+
 
                 # 添加到各自的列表中
                 test_set_data.append(nested_test_entity)
                 embedding_set_data.append(nested_embedding_entity)
                 
+                # --- ⭐ 唯一修改点在这里 ---
                 # 创建“答案”记录
+                # 按照你的要求，data_id 使用 test_identity (整数ID)
                 ground_truth_records.append({
-                    "data_id": nested_test_entity.get("_id"),
-                    "target_node_id": material_id_str,
+                    "data_id": str(test_identity), # 使用 test.json 中对应条目的整数ID
+                    "target_node_id": material_id_str, # 使用 Material 节点的整数ID
                     "relation_type": "isBelongTo"
                 })
 

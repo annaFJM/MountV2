@@ -1,3 +1,4 @@
+#!/usr/bin/env python
 # generate_embeddings_from_file_v3.py
 
 import os
@@ -48,7 +49,7 @@ def format_data_for_embedding(record):
     将 JSON 记录格式化为模型所需的文本。
     此函数会：
     1. 提取 'name' 字段。
-    2. 删除 'id', '来源', 和 'data' 字段。
+    2. 删除 'id', '来源', 'identity' 和 'data' 字段。
     3. 将所有剩余字段格式化为属性字符串。
     """
     
@@ -59,16 +60,19 @@ def format_data_for_embedding(record):
     material_name = props_copy.pop("name", "未知牌号") 
 
     # *** 这是关键修改点 ***
-    # 显式删除 'id', '来源', 和空的 'data' 字段
-    props_copy.pop("id", None)     
-    props_copy.pop("来源", None) # <--- 新增的修改
-    props_copy.pop("data", None)   
+    # 显式删除 'id' (UUID), '来源', 'data', 和 'identity' (整数ID)
+    # 这样它们就不会被包含在用于 embedding 的 "属性" 字符串中
+    props_copy.pop("id", None)       
+    props_copy.pop("来源", None) 
+    props_copy.pop("data", None)     
+    props_copy.pop("identity", None) # <--- 新增：也移除 identity
 
     # 格式化所有剩余的属性 (如 "工艺", "成分", "结构" 等)
-    props_str = ", ".join([f"{k}: {v}" for k, v in props_copy.items() if v is not None])
+    props_str = ", ".join([f"{k}: {v}" for k, v in props_copy.items() if v is not None and v != ""])
     
-    # 构建最终文本
-    instruction_text = f"材料名称: {material_name}, 材料属性: {props_str}"
+    # --- ⭐ 修改点 1: 更改指令文本格式 ---
+    # 移除 "材料名称: " 前缀，直接以 name 开头
+    instruction_text = f"{material_name}, 材料属性: {props_str}"
     
     return instruction_text
 
@@ -106,15 +110,16 @@ def main():
     with torch.no_grad():
         for record in tqdm(source_records, desc="生成向量"):
             
-            # 检查记录是否包含 'id' 和 'name' 键
-            if "id" not in record or "name" not in record:
-                print(f"⚠️ 警告：跳过一条记录，缺少 'id' 或 'name'。记录: {record}")
+            # --- ⭐ 修改点 2: 检查 'identity' 字段 ---
+            # 检查记录是否包含 'identity' 和 'name' 键
+            if "identity" not in record or "name" not in record:
+                print(f"⚠️ 警告：跳过一条记录，缺少 'identity' 或 'name'。记录: {record}")
                 continue
                 
             text = format_data_for_embedding(record)
             
             if not text:
-                print(f"⚠️ 警告：跳过 'id' {record.get('id')}，无法生成文本。")
+                print(f"⚠️ 警告：跳过 'identity' {record.get('identity')}，无法生成文本。")
                 continue
 
             try:
@@ -127,16 +132,15 @@ def main():
 
                 embeddings_list.append(embedding.cpu().numpy())
                 
-                # 使用 'id' 和 'name' 来构建元数据
-                # (注意：即使'id'从embedding文本中删除了，我们依然保留它作为元数据)
+                # --- ⭐ 修改点 3: 更改元数据格式 ---
+                # 使用 'identity' (整数ID) 作为主要标识符
                 metadata_list.append({
-                    "id": record["id"],
+                    "identity": record["identity"],
                     "name": record["name"],
-
                     "label": "Material" 
                 })
             except Exception as e:
-                print(f"\n❌ 处理 'id' {record.get('id')} 时出错: {e}")
+                print(f"\n❌ 处理 'identity' {record.get('identity')} 时出错: {e}")
 
     # 4. 保存结果
     if embeddings_list:
