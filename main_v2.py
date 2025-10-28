@@ -442,7 +442,7 @@ with open(result_filepath, 'w', encoding='utf-8') as f_out:
     # with open(DATA_FILE_PATH, "r") as f:  # 原代码
     with open("/home/thl/2025Fall/LLM_Mount_KG/test/data/test.json", "r") as f: # 测试用
         data_list = json.load(f)
-        test_data_list = data_list[:20]
+        test_data_list = data_list
         logging.info(f"--- 成功加载数据，将仅测试前 {len(test_data_list)} 条数据 ---")
         for data in test_data_list:
             supplementary_info = get_supplementary_info_from_llm(client, data)

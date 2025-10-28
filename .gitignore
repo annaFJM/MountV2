@@ -6,3 +6,4 @@ embedding/
 config.py
 test/
 test_model/
+mount_results/
