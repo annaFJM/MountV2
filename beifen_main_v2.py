@@ -41,6 +41,25 @@ client = OpenAI(
     base_url="https://dashscope.aliyuncs.com/compatible-mode/v1",
 )
 
+'''
+# --- 1. 加载运行时Embedding模型 --- # 
+RUNTIME_EMBED_MODEL_PATH = "/home/thl/models/Qwen3-4B-clustering_1078/checkpoint-936" 
+RUNTIME_EMBED_DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
+RUNTIME_EMBED_TOKENIZER = None
+RUNTIME_EMBED_MODEL = None
+
+try:
+    logging.info(f"--- 正在加载运行时Embedding模型到 {RUNTIME_EMBED_DEVICE} ---")
+    RUNTIME_EMBED_TOKENIZER = AutoTokenizer.from_pretrained(RUNTIME_EMBED_MODEL_PATH)
+    RUNTIME_EMBED_MODEL = AutoModel.from_pretrained(
+        RUNTIME_EMBED_MODEL_PATH, 
+        torch_dtype="auto"
+    ).to(RUNTIME_EMBED_DEVICE).eval()
+    logging.info(f"✅ 成功加载用于运行时推理的Embedding模型。")
+except Exception as e:
+    logging.info(f"⚠️ 警告：未能加载运行时Embedding模型: {e}")
+    logging.info("     recall_top5_materials 功能将不可用。")
+'''
 # --- 2. 加载预计算的向量库 --- # 
 # EMBEDDINGS_DB_PATH = "/home/thl/2025Fall/LLM_Mount_KG/embedding/data/material_embeddings.npy"
 # EMBEDDINGS_METADATA_PATH = "/home/thl/2025Fall/LLM_Mount_KG/embedding/data/material_metadata.json"
@@ -138,8 +157,93 @@ def get_isbelongto_inbound(inbound_ids, inbound_names, inbound_labels):
     
     return "\n".join(result_list)
 
+# 原函数
+'''
+def get_embedding_for_data(data_item):
+    """
+    (辅助函数)
+    为传入的单个材料数据（新数据）生成embedding。
+    """
+    if not RUNTIME_EMBED_MODEL or not RUNTIME_EMBED_TOKENIZER:
+        logging.info("❌ 运行时Embedding模型未加载。")
+        return None
+    
+    # 扁平化 (来自 neo4j_connector.py)
+    def flatten_dict(data_dict, parent_key='', separator='_'):
+        items = []
+        for key, value in data_dict.items():
+            new_key = f"{parent_key}{separator}{key}" if parent_key else key
+            if isinstance(value, dict):
+                items.extend(flatten_dict(value, new_key, separator=separator).items())
+            else:
+                items.append((new_key, value))
+        return dict(items)
+
+    # 将data_item（字典）转换为用于embedding的字符串
+    # 这一步的格式必须与 generate_material_embeddings.py 中的 format_data_for_embedding 一致！
+    
+    properties_to_embed = data_item.get('data', data_item)
+    
+    # 扁平化并移除元数据
+    flat_properties = flatten_dict(properties_to_embed)
+    flat_properties.pop('_id', None) 
+    flat_properties.pop('_meta_id', None)
+    flat_properties.pop('_tid', None)
+    
+    # MGE18_标题 可能是最好的 "name" 替代品
+    material_name = flat_properties.pop("MGE18_标题", "未知牌号")
+    
+    props_str = ", ".join([f"{k}: {v}" for k, v in flat_properties.items()])
+    
+    # *** 确保这个格式与离线脚本完全一致 ***
+    text = f"材料名称: {material_name}, 材料属性: {props_str}"
+    
+    with torch.no_grad():
+        inputs = RUNTIME_EMBED_TOKENIZER(text, return_tensors="pt", padding=True, truncation=True, max_length=512).to(RUNTIME_EMBED_DEVICE)
+        outputs = RUNTIME_EMBED_MODEL(**inputs)
+        last_hidden_state = outputs.last_hidden_state
+        # 使用 mean pooling
+        embedding = last_hidden_state.mean(dim=1).squeeze()
+    
+    return embedding.cpu().numpy()
+'''
+'''
+# 测试用
+
+def get_embedding_for_data(data_item):
+    """
+    (辅助函数)
+    为传入的单个材料数据（新数据）生成embedding。
+    *** 已更新，以匹配 v3 离线脚本的逻辑 ***
+    """
+    if not RUNTIME_EMBED_MODEL or not RUNTIME_EMBED_TOKENIZER:
+        logging.info("❌ 运行时Embedding模型未加载。")
+        return None
+    props_copy = data_item.copy()
+    material_name = props_copy.pop("name", "未知牌号") 
+    props_copy.pop("id", None)     
+    props_copy.pop("来源", None)   
+    props_copy.pop("data", None)   
+    props_str = ", ".join([f"{k}: {v}" for k, v in props_copy.items() if v is not None])
+
+    text = f"{material_name}, 材料属性: {props_str}"
+    
+    # 生成 Embedding
+    with torch.no_grad():
+        inputs = RUNTIME_EMBED_TOKENIZER(text, return_tensors="pt", padding=True, truncation=True, max_length=512).to(RUNTIME_EMBED_DEVICE)
+        outputs = RUNTIME_EMBED_MODEL(**inputs)
+        last_hidden_state = outputs.last_hidden_state
+        embedding = last_hidden_state.mean(dim=1).squeeze()
+    
+    return embedding.cpu().numpy()
+'''
 # 调用qwen的embedding
 def get_embedding_for_data(data_item):
+    """
+    (辅助函数)
+    为传入的单个材料数据（新数据）生成embedding。
+    *** 已更新为使用 DashScope API ***
+    """
     
     # 检查全局 client 是否已初始化
     if client is None:
@@ -181,6 +285,14 @@ def get_embedding_for_data(data_item):
         return None
 
 def recall_top5_materials(current_node_id, data_item):
+    """
+    (工具函数实现)
+    在当前节点下，根据材料数据，通过向量召回Top-5最相似的Material节点。
+    current_node_id: 当前节点ID
+    data_item: 完整的材料数据 (用于生成embedding)
+    """
+    # if MATERIAL_EMBEDDINGS is None or not MATERIAL_METADATA or RUNTIME_EMBED_MODEL is None:
+    #    return "向量召回功能不可用（模型或向量库未加载）。请使用 get_include_outbound 或 get_isbelongto_inbound。"
     if MATERIAL_EMBEDDINGS is None or not MATERIAL_METADATA:
         return "向量召回功能不可用（预计算的向量库未加载）。请使用 get_include_outbound 或 get_isbelongto_inbound。"
     # 1. 为新数据生成向量
@@ -267,7 +379,64 @@ with open('/home/thl/2025Fall/LLM_Mount_KG/tools.json', 'r', encoding='utf-8') a
     tools = json.load(f)
 
 # LLM调用接口
+'''
+client = OpenAI(
+    api_key=DEEPSEEK_API_KEY, #已脱敏
+    base_url=DEEPSEEK_BASE_URL,
+)
 
+client = Ark(
+    base_url="https://ark.cn-beijing.volces.com/api/v3",
+    api_key=os.environ.get("ARK_API_KEY"),
+)
+'''
+
+def get_supplementary_info_from_llm(client, data_item):
+    """
+    (新增函数)
+    调用LLM（火山）获取材料的补充摘要信息。
+    """
+    try:
+        # 提取name和成分
+        material_name = data_item.get("name", "未知")
+        composition = data_item.get("成分", "未知")
+
+        # 如果关键信息缺失，则不调用
+        if material_name == "未知" and composition == "未知":
+            logging.info("--- 补充信息：name和成分均未知，跳过LLM调用 ---")
+            return "N/A"
+            
+        # 构建类似图片中的提示
+        prompt_content = f"""
+1. 请识别材料的成分。
+2. 分析各成分的性质。
+3. 基于材料各成分的性质理解这可能是什么样的材料。
+
+name: '{material_name}'
+成分: '{composition}'
+
+请用100字以内告诉我这是什么具体的材料类型，包括简单的判断原因。
+"""
+        
+        logging.info(f"--- 正在调用LLM获取补充信息 (Name: {material_name})... ---")
+        
+        response = client.chat.completions.create(
+            # model="ep-20251027162913-hvhdm",  # 使用与主循环相同的模型
+            model="qwen3-max",
+            messages=[
+                {"role": "system", "content": "你是一个材料科学专家，请简明扼要地分析材料。"},
+                {"role": "user", "content": prompt_content}
+            ],
+            # 注意：这里不需要 tools
+        )
+        
+        summary = response.choices[0].message.content
+        logging.info(f"--- 成功获取补充信息: {summary} ---")
+        return summary
+
+    except Exception as e:
+        logging.warning(f"⚠️ 调用LLM获取补充信息失败: {e}")
+        return "获取补充信息失败"
     
 with open(result_filepath, 'w', encoding='utf-8') as f_out:
     # with open(DATA_FILE_PATH, "r") as f:  # 原代码
