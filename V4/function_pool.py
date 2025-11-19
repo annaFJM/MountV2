@@ -2,6 +2,9 @@ import json
 import logging
 import numpy as np
 from numpy.linalg import norm
+import os
+import pandas as pd
+from chem_utils import extract_elements_from_data_item, calculate_jaccard_similarity
 
 class FunctionPool:
     def __init__(self, neo4j_connector, llm_client, material_embeddings, material_metadata):
@@ -16,6 +19,14 @@ class FunctionPool:
         self.client = llm_client
         self.material_embeddings = material_embeddings
         self.material_metadata = material_metadata
+        self.cache_dir = "Class_material_info"
+
+        self.id_to_index_map = {}
+        if self.material_metadata:
+            for idx, item in enumerate(self.material_metadata):
+                nid = item.get('identity') 
+                if nid is not None:
+                    self.id_to_index_map[nid] = idx
 
     def get_include_outbound(self, id):
         """获取所有include出边并格式化信息"""
@@ -75,6 +86,103 @@ class FunctionPool:
         
         return "\n".join(result_list)
 
+    def calculate_cosine_similarity(self, vec_a, vec_b):
+        """计算两个向量的余弦相似度"""
+        if vec_a is None or vec_b is None:
+            return 0.0
+        norm_a = norm(vec_a)
+        norm_b = norm(vec_b)
+        if norm_a == 0 or norm_b == 0:
+            return 0.0
+        return np.dot(vec_a, vec_b) / (norm_a * norm_b)
+
+    def match_materials_by_elements(self, class_id, data_item):
+        """
+        【最终方案】基于两阶段过滤，返回向量相似度最高的 Top 5 名称（不带分数）。
+        1. 找出元素相似度最高的所有候选。
+        2. 在这些最高相似度中，找出向量相似度最高的 Top 5。
+        """
+        csv_path = os.path.join(self.cache_dir, f"{class_id}_material_info.csv")
+        
+        if not os.path.exists(csv_path):
+            logging.warning(f"⚠️ 未找到节点 {class_id} 的元素缓存文件。")
+            return None
+            
+        # 1. 提取输入数据的元素
+        input_elements = extract_elements_from_data_item(data_item)
+        if not input_elements:
+            logging.info("⚠️ 输入数据无有效元素，跳过元素匹配。")
+            return None 
+            
+        logging.info(f"--- 正在进行元素匹配 (筛选 Top 5 名称)，输入元素: {input_elements} ---")
+        
+        try:
+            # 2. 读取与计算 Jaccard (Element Score)
+            df = pd.read_csv(csv_path)
+            df['set_obj'] = df['set'].apply(lambda x: eval(x) if isinstance(x, str) else set())
+            df['elem_score'] = df['set_obj'].apply(lambda x: calculate_jaccard_similarity(input_elements, x))
+            
+            # 3. 【阶段一】找出最高的元素匹配度 Max Score 并过滤
+            candidates = df[df['elem_score'] > 0].copy()
+            if candidates.empty:
+                logging.info("--- 元素匹配无结果 (无交集) ---")
+                return None
+
+            max_elem_score = candidates['elem_score'].max()
+            # 过滤：只保留达到 Max Score 的候选
+            best_elem_candidates = candidates[candidates['elem_score'] == max_elem_score].copy()
+            
+            logging.info(f"--- 元素匹配最高分: {max_elem_score:.4f}。共有 {len(best_elem_candidates)} 个候选进入第二阶段。---")
+
+            # 4. 计算向量分数 (只计算 Stage 1 选出的候选)
+            input_embedding = self.get_embedding_for_data(data_item)
+            if input_embedding is not None:
+                input_embedding = input_embedding.flatten()
+            
+            # 辅助函数：计算向量分数。无向量时返回 -1.0 作为最低分。
+            def get_vec_score(row_id):
+                node_id_int = int(row_id)
+                if input_embedding is not None and self.material_embeddings is not None:
+                    if node_id_int in self.id_to_index_map:
+                        idx = self.id_to_index_map[node_id_int]
+                        target_vec = self.material_embeddings[idx]
+                        return self.calculate_cosine_similarity(input_embedding, target_vec)
+                return -1.0 
+
+            # 计算向量分数
+            best_elem_candidates['vec_score'] = best_elem_candidates['ID'].apply(get_vec_score)
+            
+            # 5. 【阶段二】排序并取 Top 5 (优先向量分，其次元素分)
+            
+            # 排序：先按向量分降序，然后按元素分降序（确保即使是 -1.0 的也按元素分排序）
+            final_matches = best_elem_candidates.sort_values(
+                by=['vec_score', 'elem_score', 'ID'], 
+                ascending=[False, False, True]
+            ).head(5)
+
+            # 6. 格式化输出 (只提供 Name, ID, Label, 无分数)
+            result_list = []
+            for i, (_, row) in enumerate(final_matches.iterrows()):
+                node_id = row['ID']
+                node_name = row['Name']
+                node_label = row['Label']
+                
+                # 记录 Log，方便调试
+                logging.info(f"   -> Top {i+1}: {node_name} (Elem: {row['elem_score']:.4f}, Vec: {row['vec_score']:.4f})")
+                
+                # 格式化输出为简单选项，交给 LLM 决定
+                info = (f"- 选项{chr(ord('A')+i)}: {node_name}, id为{node_id}, 节点属性为{node_label}")
+                result_list.append(info)
+                
+            if not result_list:
+                 return None
+                 
+            return "\n".join(result_list)
+
+        except Exception as e:
+            logging.error(f"❌ 元素匹配过程中出错: {e}", exc_info=True)
+            return None
+        
     def get_embedding_for_data(self, data_item):
         """为传入的单个材料数据生成embedding (调用 API)"""
         if self.client is None:

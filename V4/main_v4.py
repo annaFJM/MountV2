@@ -14,6 +14,7 @@ from config import (
 )
 from neo4j_connector import Neo4jConnector
 from function_pool import FunctionPool
+from preprocess_kg import generate_class_material_info, CACHE_DIR
 
 # --- 1. 基础环境与日志配置 ---
 log_dir = "/home/thl/2025Fall/LLM_Mount_KG/V4/log"
@@ -41,8 +42,8 @@ client = OpenAI(
 )
 
 # 加载向量库数据
-EMBEDDINGS_DB_PATH = "/home/thl/2025Fall/LLM_Mount_KG/test/data/material_embeddings_qwenAPI.npy"
-EMBEDDINGS_METADATA_PATH = "/home/thl/2025Fall/LLM_Mount_KG/test/data/material_metadata_qwenAPI.json"
+EMBEDDINGS_DB_PATH = "/home/thl/2025Fall/LLM_Mount_KG/V4/test_data_from_KG/data/material_embeddings_qwenAPI.npy"
+EMBEDDINGS_METADATA_PATH = "/home/thl/2025Fall/LLM_Mount_KG/V4/test_data_from_KG/data/material_metadata_qwenAPI.json"
 MATERIAL_EMBEDDINGS = None
 MATERIAL_METADATA = []
 
@@ -53,6 +54,12 @@ try:
     logging.info(f"✅ 成功加载 {len(MATERIAL_METADATA)} 条预计算的Material向量。")
 except Exception as e:
     logging.info(f"⚠️ 警告：未能加载向量库: {e}。recall_top5_materials 功能将不可用。")
+
+if not os.path.exists(CACHE_DIR) or not os.listdir(CACHE_DIR):
+    logging.info("检测到 Class_material_info 文件夹不存在或为空，开始执行预处理...")
+    generate_class_material_info()
+else:
+    logging.info("检测到 Class_material_info 文件夹已存在，跳过预处理。")
 
 # --- 3. 实例化 FunctionPool ---
 pool = FunctionPool(neo4j_conn, client, MATERIAL_EMBEDDINGS, MATERIAL_METADATA)
@@ -71,11 +78,11 @@ with open('/home/thl/2025Fall/LLM_Mount_KG/V4/tool.json', 'r', encoding='utf-8')
 if __name__ == "__main__":
     with open(result_filepath, 'w', encoding='utf-8') as f_out:
         # 加载测试数据
-        test_data_path = "/home/thl/2025Fall/LLM_Mount_KG/test/data/test.json"
+        test_data_path = "/home/thl/2025Fall/LLM_Mount_KG/V4/test_data_from_KG/test.json"
         with open(test_data_path, "r") as f:
             # test_data_list = json.load(f)
             data_list = json.load(f)
-            test_data_list = data_list[:2]
+            test_data_list = data_list
             logging.info(f"--- 成功加载数据，共 {len(test_data_list)} 条 ---")
 
         for data in test_data_list:
@@ -153,11 +160,21 @@ if __name__ == "__main__":
                         total_count = len(inbound_ids)
 
                         if total_count > 5:
-                            logging.info(f"--- 节点 {curr_id} 实例过多 ({total_count}个)，自动触发向量召回 ---")
-                            tool_result = pool.recall_top5_materials(func_args["id"], data)
+                            logging.info(f"--- 节点 {curr_id} 实例过多 ({total_count}个)，尝试元素匹配 ---")
+                            # 【核心修改】优先尝试元素匹配
+                            element_match_result = pool.match_materials_by_elements(func_args["id"], data)
+                            
+                            if element_match_result:
+                                logging.info("✅ 元素匹配成功，使用元素匹配结果。")
+                                tool_result = element_match_result
+                            else:
+                                logging.info("⚠️ 元素匹配失败（无法提取元素或无交集），回退到向量召回。")
+                                tool_result = pool.recall_top5_materials(func_args["id"], data)
+                                
                             if not tool_result or "不可用" in tool_result or "失败" in tool_result:
-                                extra_info = "向量召回失败，终止当前数据。"
+                                extra_info = "召回失败（元素及向量均失效），终止当前数据。"
                                 break
+
                         elif 0 < total_count <= 5:
                             logging.info(f"--- 节点 {curr_id} 实例数量可控 ({total_count}个)，使用 get_isbelongto_inbound ---")
                             # 调用 Pool 中的格式化方法
@@ -187,6 +204,30 @@ if __name__ == "__main__":
                     # 清空 extra_info
                     extra_info = ""
                     # --- 第二次调用 LLM：基于工具结果选择去向 ---
+                    # 1. 定义两套决策提示词
+                    
+                    # 方案 A: 默认导航提示词 (用于 Class 节点选择 或 简单 Material 列表)
+                    default_decision_guide = """
+请根据节点去向信息（包括名称和下游节点相关例子），选择一个与当前材料数据最接近的类型的材料去向输出。
+"""
+
+                    # 方案 B: 复杂材料匹配提示词 (仅当工具返回了详细的匹配分数时使用)
+                    material_match_guide = """
+# 决策依据（重要！）
+请综合考虑【元素匹配度】和【向量相似度】选择最合适的节点：
+1. **优先看元素匹配度**：如果某个选项的元素匹配度明显高于其他（例如 1.0 vs 0.5），通常应选它。
+2. **结合向量相似度**：如果多个选项的元素匹配度相同（例如都是 1.0）或非常接近，请选择**向量相似度更高**的那个。
+3. 如果有"无向量"标记，仅参考元素匹配度。
+"""
+
+                    # 2. 动态选择提示词
+                    # 逻辑：如果 tool_result 里包含我们生成的 "元素匹配度" 关键字，说明刚才执行了高级匹配，使用方案 B
+                    #if "元素匹配度" in tool_result:
+                    #    decision_guide = material_match_guide
+                    #else:
+                    #    decision_guide = default_decision_guide
+                    decision_guide = default_decision_guide
+                    # 3. 组装最终 Prompt
                     prompt = f"""
 # 任务说明
 你正在材料知识图谱中导航，你需要抉择当前节点的走向。
@@ -199,7 +240,7 @@ if __name__ == "__main__":
 # 节点去向
 {tool_result}
 
-请根据节点去向信息（包括名称和下游节点相关例子），选择一个与当前材料数据最接近的类型的材料去向输出。
+{decision_guide}
 请严格按照以下格式输出ID，名称，标签，不要添加任何额外文字：
 [节点ID] [节点名称] [节点标签]
 

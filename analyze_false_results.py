@@ -123,7 +123,7 @@ def main():
         print("使用方法:")
         print("  python analyze_false_results.py <csv_file>")
         print("\n示例:")
-        print("  python analyze_false_results.py /home/thl/2025Fall/LLM_Mount_KG/mount_results/mount_result_20251027_134736.csv")
+        print("  python analyze_false_results.py /home/thl/2025Fall/LLM_Mount_KG/mount_results/mount_result_20251118_141241.csv")
         sys.exit(1)
     
     csv_file = sys.argv[1]

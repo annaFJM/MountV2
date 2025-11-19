@@ -138,7 +138,7 @@ def main():
         sys.exit(1)
     
     prediction_file = sys.argv[1]
-    ground_truth_file = "/home/thl/2025Fall/LLM_Mount_KG/test/data/ground_truth.jsonl"
+    ground_truth_file = "/home/thl/2025Fall/LLM_Mount_KG/V4/test_data_from_KG/ground_truth.jsonl"
     output_dir = "/home/thl/2025Fall/LLM_Mount_KG/mount_results"
     
     # 检查文件是否存在

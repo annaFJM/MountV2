@@ -7,3 +7,6 @@ config.py
 test/
 test_model/
 mount_results/
+test_data_from_KG/
+Class_material_info/
+name_explore/
